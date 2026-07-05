@@ -1,2 +1,0 @@
--I/nix/store/q5wv2ldpcv5w8yb2wmsngsygvlxb73fk-glibc-2.42-67-dev/include
--frandom-seed=34m23n2rbq
