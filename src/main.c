@@ -1,20 +1,39 @@
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <assert.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include <pthread.h>
 #include <string.h>
+#include <time.h>
 
-#include "include/itypes.h"
-#include "include/utils.h"
+#include "cutils/itypes.h"
+#include "cutils/utils.h"
+#include "lib/slice.h"
 
 #define PORT 8080
 #define VERSION "HTTP/1.1"
 
 #define STATUS_LINE_MAX_LEN 64
 #define HEADER_FIELD_MAX_LEN 256
+
+
+static const char *http_methods[] = {
+    "GET",
+};
+
+
+static bool is_valid_method(Slice *method)
+{
+    u8 n = sizeof(http_methods) / sizeof(char*);
+    for (u8 i = 0; i < n; i++) {
+        if (slice_cmp_str(method, http_methods[i])) return true;
+    }
+    return false;
+}
 
 typedef enum {
     HTTP_OK                    = 200,
@@ -28,25 +47,126 @@ typedef enum {
     HTTP_VERSION_NOT_SUPPORTED = 505
 } HTTPStatusCode;
 
-static inline const char* http_status_reason_phrase(HTTPStatusCode code)
+static inline const char* http_reason_phrase(HTTPStatusCode code)
 {
     switch (code) {
-        case HTTP_OK: return "Ok";
-        case HTTP_CONTINUE: return "Continue";
-        case HTTP_NOT_MODIFIED: return "Not Modified";
-        case HTTP_BAD_REQUEST: return "Bad Request";
-        case HTTP_NOT_FOUND: return "Not Found";
-        case HTTP_METHOD_NOT_ALLOWED: return "Method Not Allowed";
+        case HTTP_OK                   : return "Ok";
+        case HTTP_CONTINUE             : return "Continue";
+        case HTTP_NOT_MODIFIED         : return "Not Modified";
+        case HTTP_BAD_REQUEST          : return "Bad Request";
+        case HTTP_NOT_FOUND            : return "Not Found";
+        case HTTP_METHOD_NOT_ALLOWED   : return "Method Not Allowed";
         case HTTP_INTERNAL_SERVER_ERROR: return "Internal Server Error";
-        case HTTP_NOT_IMPLEMENTED: return "Not Implemented";
+        case HTTP_NOT_IMPLEMENTED      : return "Not Implemented";
         case HTTP_VERSION_NOT_SUPPORTED: return "Version Not Supported";
-        default: return "Unknown";
+        default                        : return "Unknown";
     }
+}
+
+typedef struct {
+    char* buf;
+    usize curr;
+    usize len;
+} Lexer;
+
+typedef struct {
+    Slice field;
+    Slice value;
+} HTTPHeaderFieldLine;
+
+typedef struct {
+    HTTPHeaderFieldLine *content;
+    usize len;
+    usize capacity;
+} HTTPRequestHeader;
+
+typedef struct {
+    Slice method;
+    Slice target;
+    Slice version;
+    HTTPRequestHeader header;
+    Slice body;
+} HTTPRequest;
+
+typedef struct {
+    HTTPStatusCode status;
+    char *type;
+    char *body;
+    usize len;
+} HTTPResponse;
+
+
+static bool token(char ch)
+{
+    if (isalnum(ch)) return true;
+    switch (ch) {
+        case '!': case '#': case '$': case '%': case '&': 
+        case '\'': case '*': case '+': case '-': case '.': 
+        case '^': case '_': case '`': case '|': case '~':
+            return true;
+    }
+    return false;
+}
+
+static inline bool CRLF(char ch) { return ch == '\n' || ch == '\r'; }
+static inline bool SP(char ch) { return ch == ' '; }
+static inline bool uri(char ch) { return !(ch <= 32 || ch == 127); }
+static inline bool http_version(char ch) { return isalnum(ch) || ch == '.' || ch == '/'; }
+
+static inline bool lexer_advance(Lexer *lexer, Slice *lexeme, bool(*validate)(char))
+{
+    *lexeme = (Slice){ lexer->buf + lexer->curr, 0 };
+    while (lexer->curr < lexer->len && validate(lexer->buf[lexer->curr])) {
+        lexer->curr++;
+        lexeme->len++;
+    }
+    return lexer->curr < lexer->len;
+}
+
+static inline void lexer_skip(Lexer *lexer, bool(*validate)(char))
+{
+    while (lexer->curr < lexer->len && validate(lexer->buf[lexer->curr])) lexer->curr++;
+}
+
+static bool is_valid_target(Slice *uri)
+{
+    return slice_cmp_str(uri, "/"); // TODO
+}
+
+static void parse_request(Lexer *lexer, HTTPRequest *req, HTTPResponse *res)
+{
+    // ------------------
+    // -- request line --
+    // ------------------
+    lexer_skip(lexer, SP);
+    lexer_advance(lexer, &req->method,  token);                        // method
+    if (req->method.len > 16 || !is_valid_method(&req->method)) {
+        res->status = HTTP_NOT_IMPLEMENTED;
+        return;
+    }
+    lexer_skip(lexer, SP);
+
+    lexer_advance(lexer, &req->target,  uri);                          // target
+    if (!is_valid_target(&req->target)) {
+        res->status = HTTP_NOT_FOUND;
+        return;
+    }
+    lexer_skip(lexer, SP);
+
+    lexer_advance(lexer, &req->version, http_version);                 // version
+    if (!slice_cmp_str(&req->version, VERSION)) {
+        res->status = HTTP_VERSION_NOT_SUPPORTED;
+        return;
+    }
+    lexer_skip(lexer, SP);
+    lexer_skip(lexer, CRLF);
+
+    res->status = HTTP_OK;
 }
 
 static inline u32 write_status_line(HTTPStatusCode code, char* dest)
 {
-    return snprintf(dest, STATUS_LINE_MAX_LEN, "%s %u %s\r\n", VERSION, code, http_status_reason_phrase(code));
+    return snprintf(dest, STATUS_LINE_MAX_LEN, "%s %u %s\r\n", VERSION, code, http_reason_phrase(code));
     
 }
 
@@ -69,33 +189,43 @@ static inline u32 write_header(char* dest, usize len)
     , date, len);
 }
 
-static void* request_handler(void *void_fd)
+static void* serve_request(void *void_fd)
 {
     i32 fd = *(i32 *)void_fd;
     free(void_fd);
 
-    char buffer[2048];
+    HTTPRequest req = {0};
+    HTTPResponse res = {0};
+    char buf[2048];
     
-    ssize_t bytes = recv(fd, buffer, sizeof(buffer) - 1, 0);
+    ssize_t bytes = recv(fd, buf, sizeof(buf) - 1, 0);
     if (bytes > 0) {
-        buffer[bytes] = '\0';
-
+        Lexer lexer = { buf, 0, bytes };
+        parse_request(&lexer, &req, &res);
 
         char status_line[STATUS_LINE_MAX_LEN];
         char header[HEADER_FIELD_MAX_LEN];
         const char* body =
             "<html>"
                 "<body>"
-                    "<h1>Iamhari.</h1>"
+                    "<center>"
+                        "<h1>Webserver server born in C</h1>"
+                        "<br>How do we fall apart? Faster than a hairpin trigger..."
+                        "<br>One breath, it'll just break"
+                        "<br>So shut your mouth and run it like a river"
+                        "<br>Flow like a river"
+                    "</center>"
                 "</body>"
             "</html>";
 
-        write_status_line(HTTP_OK, status_line);
+        write_status_line(res.status, status_line);
         write_header(header, strlen(body));
 
-        snprintf(buffer, 2048, "%s%s\r\n%s", status_line, header, body);
+        snprintf(buf, 2048, "%s%s\r\n%s", status_line, header, body);
+        printf("%s\n", buf);
 
-        send(fd, buffer, strlen(buffer), 0);
+        send(fd, buf, strlen(buf), 0);
+        
     }
     close(fd);
     return NULL;
@@ -141,7 +271,7 @@ i32 main()
         
         pthread_t tid;
 
-        if (pthread_create(&tid, &attr, request_handler, exclusive_fd) != 0) {
+        if (pthread_create(&tid, &attr, serve_request, exclusive_fd) != 0) {
             perror("Failed to create thread");
             close(client_fd);
             free(exclusive_fd);
