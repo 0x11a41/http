@@ -11,8 +11,9 @@
 #include <time.h>
 
 #include "cutils/itypes.h"
-#include "cutils/utils.h"
 #include "lib/slice.h"
+#include "cutils/da.h"
+#include "cutils/utils.h"
 
 #define PORT 8080
 #define VERSION "HTTP/1.1"
@@ -108,10 +109,14 @@ static bool token(char ch)
     return false;
 }
 
-static inline bool CRLF(char ch) { return ch == '\n' || ch == '\r'; }
+static inline bool CR(char ch) { return ch == '\r'; }
+static inline bool LF(char ch) { return ch == '\n'; }
 static inline bool SP(char ch) { return ch == ' '; }
 static inline bool uri(char ch) { return !(ch <= 32 || ch == 127); }
 static inline bool http_version(char ch) { return isalnum(ch) || ch == '.' || ch == '/'; }
+static inline bool COLON(char ch) { return ch == ':'; }
+static inline bool FIELDVAL(char ch) { return !(ch < 32 || ch == 127); }
+static inline bool ANY(char ch) { (void)ch; return true; }
 
 static inline bool lexer_advance(Lexer *lexer, Slice *lexeme, bool(*validate)(char))
 {
@@ -148,6 +153,9 @@ static void parse_request(Lexer *lexer, HTTPRequest *req, HTTPResponse *res)
 
     lexer_advance(lexer, &req->target,  uri);                          // target
     if (!is_valid_target(&req->target)) {
+
+        // TODO origin-form | authority-form | absolute-form | asterisk-form
+        
         res->status = HTTP_NOT_FOUND;
         return;
     }
@@ -159,15 +167,38 @@ static void parse_request(Lexer *lexer, HTTPRequest *req, HTTPResponse *res)
         return;
     }
     lexer_skip(lexer, SP);
-    lexer_skip(lexer, CRLF);
+    lexer_skip(lexer, CR); lexer_skip(lexer, LF);
+    // -------------------
+    // -- Header fields --
+    // -------------------
+    Slice head_body_separator = {0};
 
+    while (head_body_separator.len == 0) {
+        Slice field = {0}, value = {0};
+        lexer_skip(lexer, SP);
+        lexer_advance(lexer, &field, token);
+
+        lexer_skip(lexer, COLON);
+
+        lexer_skip(lexer, SP);
+        lexer_advance(lexer, &value, FIELDVAL);
+        lexer_skip(lexer, SP);
+
+        lexer_skip(lexer, CR); lexer_skip(lexer, LF);
+
+        da_append(req->header, ((HTTPHeaderFieldLine){field, value}));
+        lexer_skip(lexer, CR); lexer_advance(lexer, &head_body_separator, LF);
+    }
+    // ----------
+    // -- Body --
+    // ----------
+    lexer_advance(lexer, &req->body, ANY);
     res->status = HTTP_OK;
 }
 
 static inline u32 write_status_line(HTTPStatusCode code, char* dest)
 {
     return snprintf(dest, STATUS_LINE_MAX_LEN, "%s %u %s\r\n", VERSION, code, http_reason_phrase(code));
-    
 }
 
 static inline u32 write_http_date(char *dest) {
@@ -189,6 +220,20 @@ static inline u32 write_header(char* dest, usize len)
     , date, len);
 }
 
+static void debug_request(HTTPRequest *req)
+{
+    if (DEBUG == 0) return;
+    debug("\n");
+    debug("[ "); slice_debug(&req->method); debug(" ]::");
+    debug("[ "); slice_debug(&req->target); debug(" ]::");
+    debug("[ "); slice_debug(&req->version); debug(" ]\n");
+    for (u32 i = 0; i < req->header.len; i++) {
+        debug("[ "); slice_debug(&req->header.content[i].field); debug(" ]::");
+        debug("[ "); slice_debug(&req->header.content[i].value); debug(" ]\n");
+    }
+    debug("[[ "); slice_debug(&req->body); debug(" ]]\n");
+}
+
 static void* serve_request(void *void_fd)
 {
     i32 fd = *(i32 *)void_fd;
@@ -202,6 +247,7 @@ static void* serve_request(void *void_fd)
     if (bytes > 0) {
         Lexer lexer = { buf, 0, bytes };
         parse_request(&lexer, &req, &res);
+        debug_request(&req);
 
         char status_line[STATUS_LINE_MAX_LEN];
         char header[HEADER_FIELD_MAX_LEN];
@@ -209,11 +255,8 @@ static void* serve_request(void *void_fd)
             "<html>"
                 "<body>"
                     "<center>"
-                        "<h1>Webserver server born in C</h1>"
-                        "<br>How do we fall apart? Faster than a hairpin trigger..."
-                        "<br>One breath, it'll just break"
-                        "<br>So shut your mouth and run it like a river"
-                        "<br>Flow like a river"
+                        "<h1 style=\"color:red;\">I'm a poor little http server</h1>"
+                        "<h1>I'm a skyline with no brakes</h1>"
                     "</center>"
                 "</body>"
             "</html>";
@@ -222,7 +265,6 @@ static void* serve_request(void *void_fd)
         write_header(header, strlen(body));
 
         snprintf(buf, 2048, "%s%s\r\n%s", status_line, header, body);
-        printf("%s\n", buf);
 
         send(fd, buf, strlen(buf), 0);
         
@@ -233,6 +275,7 @@ static void* serve_request(void *void_fd)
 
 i32 main()
 {
+    DEBUG = 1;
     i32 serv_fd = socket(AF_INET, SOCK_STREAM, 0);
     assert(serv_fd != -1);
 
@@ -253,7 +296,7 @@ i32 main()
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     pthread_attr_setstacksize(&attr, KB(256));
 
-    printf("http server running on port %d\n", PORT);
+    printf("http server running. open http://localhost:%d\n", PORT);
 
     for (;;) {
         struct sockaddr_in client_addr = {0};
