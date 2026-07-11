@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <stdbool.h>
+#include <string.h>
 #include "../cutils/itypes.h"
 #include "../cutils/utils.h"
 
@@ -12,7 +13,21 @@ typedef struct {
 
 bool slice_cmp_str(Slice *slice, const char *str)
 {
-    for (usize i = 0; i < slice->len && str[i] != '\0'; i++) {
+    usize n = strlen(str);
+    if (n != slice->len) return false;
+
+    for (usize i = 0; i < n; i++) {
+        if (slice->s[i] != str[i]) return false;
+    }
+    return true;
+}
+
+bool slice_begins_with_str(Slice *slice, const char *str)
+{
+    usize n = strlen(str);
+    if (n > slice->len) return false;
+
+    for (usize i = 0; i < n; i++) {
         if (slice->s[i] != str[i]) return false;
     }
     return true;

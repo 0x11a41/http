@@ -22,45 +22,67 @@
 #define HEADER_FIELD_MAX_LEN 256
 
 
-static const char *http_methods[] = {
-    "GET",
+static const char *allowed_methods[] = {
+    "GET", "POST",
 };
 
 
 static bool is_valid_method(Slice *method)
 {
-    u8 n = sizeof(http_methods) / sizeof(char*);
+    u8 n = sizeof(allowed_methods) / sizeof(char*);
     for (u8 i = 0; i < n; i++) {
-        if (slice_cmp_str(method, http_methods[i])) return true;
+        if (slice_cmp_str(method, allowed_methods[i])) return true;
     }
     return false;
 }
 
 typedef enum {
-    HTTP_OK                    = 200,
-    HTTP_CONTINUE              = 100,
-    HTTP_NOT_MODIFIED          = 304,
-    HTTP_BAD_REQUEST           = 400,
-    HTTP_NOT_FOUND             = 404,
-    HTTP_METHOD_NOT_ALLOWED    = 405,
-    HTTP_INTERNAL_SERVER_ERROR = 500,
-    HTTP_NOT_IMPLEMENTED       = 501,
-    HTTP_VERSION_NOT_SUPPORTED = 505
+    STATUS_OK                    = 200,
+    STATUS_CONTINUE              = 100,
+    STATUS_MOVED_PERMANENTLY     = 301,
+    STATUS_NOT_MODIFIED          = 304,
+    STATUS_BAD_REQUEST           = 400,
+    STATUS_NOT_FOUND             = 404,
+    STATUS_METHOD_NOT_ALLOWED    = 405,
+    STATUS_INTERNAL_SERVER_ERROR = 500,
+    STATUS_NOT_IMPLEMENTED       = 501,
+    STATUS_VERSION_NOT_SUPPORTED = 505,
 } HTTPStatusCode;
+
+typedef enum {
+    TARGET_MALFORMED,
+    TARGET_ORIGIN_FORM,
+    TARGET_ABSOLUTE_FORM,
+    TARGET_AUTHORITY_FORM,
+    TARGET_ASTERISK_FORM,
+} HTTPTargetForm;
+
+static inline void debug_target_form(HTTPTargetForm form)
+{
+    if (DEBUG == 0) return;
+    switch (form) {
+        case TARGET_ABSOLUTE_FORM : printf("Absolute form") ; break;
+        case TARGET_ASTERISK_FORM : printf("Asterisk form") ; break;
+        case TARGET_AUTHORITY_FORM: printf("Authority form"); break;
+        case TARGET_ORIGIN_FORM   : printf("Origin form")   ; break;
+        case TARGET_MALFORMED     : printf("Malformed")     ; break;
+    }
+}
 
 static inline const char* http_reason_phrase(HTTPStatusCode code)
 {
     switch (code) {
-        case HTTP_OK                   : return "Ok";
-        case HTTP_CONTINUE             : return "Continue";
-        case HTTP_NOT_MODIFIED         : return "Not Modified";
-        case HTTP_BAD_REQUEST          : return "Bad Request";
-        case HTTP_NOT_FOUND            : return "Not Found";
-        case HTTP_METHOD_NOT_ALLOWED   : return "Method Not Allowed";
-        case HTTP_INTERNAL_SERVER_ERROR: return "Internal Server Error";
-        case HTTP_NOT_IMPLEMENTED      : return "Not Implemented";
-        case HTTP_VERSION_NOT_SUPPORTED: return "Version Not Supported";
-        default                        : return "Unknown";
+        case STATUS_OK                   : return "Ok";
+        case STATUS_CONTINUE             : return "Continue";
+        case STATUS_MOVED_PERMANENTLY    : return "Moved Permanently";
+        case STATUS_NOT_MODIFIED         : return "Not Modified";
+        case STATUS_BAD_REQUEST          : return "Bad Request";
+        case STATUS_NOT_FOUND            : return "Not Found";
+        case STATUS_METHOD_NOT_ALLOWED   : return "Method Not Allowed";
+        case STATUS_INTERNAL_SERVER_ERROR: return "Internal Server Error";
+        case STATUS_NOT_IMPLEMENTED      : return "Not Implemented";
+        case STATUS_VERSION_NOT_SUPPORTED: return "Version Not Supported";
+        default                          : return "Unknown";
     }
 }
 
@@ -83,11 +105,44 @@ typedef struct {
 
 typedef struct {
     Slice method;
-    Slice target;
+    struct {
+        HTTPTargetForm form;
+        Slice raw;
+    } target;
     Slice version;
     HTTPRequestHeader header;
     Slice body;
 } HTTPRequest;
+
+static void debug_http_request(HTTPRequest *req)
+{
+    if (DEBUG == 0) return;
+
+    debug("\n");
+    debug("[ ");
+        slice_debug(&req->method);
+    debug(" ]::");
+    debug("[ ");
+        slice_debug(&req->target.raw);
+        debug(" => "); debug_target_form(req->target.form);
+    debug(" ]::");
+    debug("[ ");
+        slice_debug(&req->version);
+    debug(" ]\n");
+
+    for (u32 i = 0; i < req->header.len; i++) {
+        debug("[ ");
+            slice_debug(&req->header.content[i].field);
+        debug(" ]::");
+        debug("[ ");
+            slice_debug(&req->header.content[i].value);
+        debug(" ]\n");
+    }
+
+    debug("[[ ");
+        slice_debug(&req->body);
+    debug(" ]]\n");
+}
 
 typedef struct {
     HTTPStatusCode status;
@@ -112,7 +167,7 @@ static bool token(char ch)
 static inline bool CR(char ch) { return ch == '\r'; }
 static inline bool LF(char ch) { return ch == '\n'; }
 static inline bool SP(char ch) { return ch == ' '; }
-static inline bool uri(char ch) { return !(ch <= 32 || ch == 127); }
+static inline bool target(char ch) { return !(ch <= 32 || ch == 127); }
 static inline bool http_version(char ch) { return isalnum(ch) || ch == '.' || ch == '/'; }
 static inline bool COLON(char ch) { return ch == ':'; }
 static inline bool FIELDVAL(char ch) { return !(ch < 32 || ch == 127); }
@@ -133,9 +188,20 @@ static inline void lexer_skip(Lexer *lexer, bool(*validate)(char))
     while (lexer->curr < lexer->len && validate(lexer->buf[lexer->curr])) lexer->curr++;
 }
 
-static bool is_valid_target(Slice *uri)
+static HTTPTargetForm get_target_form(Slice *target)
 {
-    return slice_cmp_str(uri, "/"); // TODO
+    if (target->len <= 0) goto malformed;
+
+    if (slice_begins_with_str(target, "http"))
+        return TARGET_ABSOLUTE_FORM;
+    else if (slice_cmp_str(target, "*"))
+        return TARGET_ASTERISK_FORM;
+    else if (*target->s == '/')
+        return TARGET_ORIGIN_FORM;
+    else goto malformed;
+    
+    malformed:
+        return TARGET_MALFORMED;
 }
 
 static void parse_request(Lexer *lexer, HTTPRequest *req, HTTPResponse *res)
@@ -146,24 +212,22 @@ static void parse_request(Lexer *lexer, HTTPRequest *req, HTTPResponse *res)
     lexer_skip(lexer, SP);
     lexer_advance(lexer, &req->method,  token);                        // method
     if (req->method.len > 16 || !is_valid_method(&req->method)) {
-        res->status = HTTP_NOT_IMPLEMENTED;
+        res->status = STATUS_NOT_IMPLEMENTED;
         return;
     }
     lexer_skip(lexer, SP);
 
-    lexer_advance(lexer, &req->target,  uri);                          // target
-    if (!is_valid_target(&req->target)) {
-
-        // TODO origin-form | authority-form | absolute-form | asterisk-form
-        
-        res->status = HTTP_NOT_FOUND;
+    lexer_advance(lexer, &req->target.raw,  target);                          // target
+    req->target.form = get_target_form(&req->target.raw);
+    if (req->target.form == TARGET_MALFORMED) {
+        res->status = STATUS_MOVED_PERMANENTLY;
         return;
     }
     lexer_skip(lexer, SP);
 
     lexer_advance(lexer, &req->version, http_version);                 // version
     if (!slice_cmp_str(&req->version, VERSION)) {
-        res->status = HTTP_VERSION_NOT_SUPPORTED;
+        res->status = STATUS_VERSION_NOT_SUPPORTED;
         return;
     }
     lexer_skip(lexer, SP);
@@ -175,25 +239,22 @@ static void parse_request(Lexer *lexer, HTTPRequest *req, HTTPResponse *res)
 
     while (head_body_separator.len == 0) {
         Slice field = {0}, value = {0};
-        lexer_skip(lexer, SP);
-        lexer_advance(lexer, &field, token);
-
+        lexer_skip(lexer, SP); lexer_advance(lexer, &field, token);
         lexer_skip(lexer, COLON);
-
-        lexer_skip(lexer, SP);
-        lexer_advance(lexer, &value, FIELDVAL);
-        lexer_skip(lexer, SP);
+        lexer_skip(lexer, SP); lexer_advance(lexer, &value, FIELDVAL); lexer_skip(lexer, SP);
 
         lexer_skip(lexer, CR); lexer_skip(lexer, LF);
 
         da_append(req->header, ((HTTPHeaderFieldLine){field, value}));
-        lexer_skip(lexer, CR); lexer_advance(lexer, &head_body_separator, LF);
+
+        lexer_skip(lexer, CR);
+        lexer_advance(lexer, &head_body_separator, LF);
     }
     // ----------
     // -- Body --
     // ----------
     lexer_advance(lexer, &req->body, ANY);
-    res->status = HTTP_OK;
+    res->status = STATUS_OK;
 }
 
 static inline u32 write_status_line(HTTPStatusCode code, char* dest)
@@ -220,20 +281,6 @@ static inline u32 write_header(char* dest, usize len)
     , date, len);
 }
 
-static void debug_request(HTTPRequest *req)
-{
-    if (DEBUG == 0) return;
-    debug("\n");
-    debug("[ "); slice_debug(&req->method); debug(" ]::");
-    debug("[ "); slice_debug(&req->target); debug(" ]::");
-    debug("[ "); slice_debug(&req->version); debug(" ]\n");
-    for (u32 i = 0; i < req->header.len; i++) {
-        debug("[ "); slice_debug(&req->header.content[i].field); debug(" ]::");
-        debug("[ "); slice_debug(&req->header.content[i].value); debug(" ]\n");
-    }
-    debug("[[ "); slice_debug(&req->body); debug(" ]]\n");
-}
-
 static void* serve_request(void *void_fd)
 {
     i32 fd = *(i32 *)void_fd;
@@ -247,7 +294,7 @@ static void* serve_request(void *void_fd)
     if (bytes > 0) {
         Lexer lexer = { buf, 0, bytes };
         parse_request(&lexer, &req, &res);
-        debug_request(&req);
+        debug_http_request(&req);
 
         char status_line[STATUS_LINE_MAX_LEN];
         char header[HEADER_FIELD_MAX_LEN];
@@ -255,7 +302,6 @@ static void* serve_request(void *void_fd)
             "<html>"
                 "<body>"
                     "<center>"
-                        "<h1 style=\"color:red;\">I'm a poor little http server</h1>"
                         "<h1>I'm a skyline with no brakes</h1>"
                     "</center>"
                 "</body>"
@@ -269,6 +315,7 @@ static void* serve_request(void *void_fd)
         send(fd, buf, strlen(buf), 0);
         
     }
+    free(req.header.content);
     close(fd);
     return NULL;
 }
