@@ -11,9 +11,13 @@
 #include <time.h>
 
 #include "cutils/itypes.h"
-#include "lib/slice.h"
-#include "cutils/da.h"
 #include "cutils/utils.h"
+
+#define SLICE_IMPLEMENTATION
+#include "cutils/slice.h"
+
+#define SLICE_MAP_IMPLEMENTATION
+#include "cutils/slice_map.h"
 
 #define PORT 8080
 #define VERSION "HTTP/1.1"
@@ -22,9 +26,7 @@
 #define HEADER_FIELD_MAX_LEN 256
 
 
-static const char *allowed_methods[] = {
-    "GET", "POST",
-};
+static const char *allowed_methods[] = { "GET", "POST", };
 
 
 static bool is_valid_method(Slice *method)
@@ -98,51 +100,15 @@ typedef struct {
 } HTTPHeaderFieldLine;
 
 typedef struct {
-    HTTPHeaderFieldLine *content;
-    usize len;
-    usize capacity;
-} HTTPRequestHeader;
-
-typedef struct {
     Slice method;
     struct {
         HTTPTargetForm form;
         Slice raw;
     } target;
     Slice version;
-    HTTPRequestHeader header;
+    SliceMap *header;
     Slice body;
 } HTTPRequest;
-
-static void debug_http_request(HTTPRequest *req)
-{
-    if (DEBUG == 0) return;
-
-    debug("\n");
-    debug("[ ");
-        slice_debug(&req->method);
-    debug(" ]::");
-    debug("[ ");
-        slice_debug(&req->target.raw);
-        debug(" => "); debug_target_form(req->target.form);
-    debug(" ]::");
-    debug("[ ");
-        slice_debug(&req->version);
-    debug(" ]\n");
-
-    for (u32 i = 0; i < req->header.len; i++) {
-        debug("[ ");
-            slice_debug(&req->header.content[i].field);
-        debug(" ]::");
-        debug("[ ");
-            slice_debug(&req->header.content[i].value);
-        debug(" ]\n");
-    }
-
-    debug("[[ ");
-        slice_debug(&req->body);
-    debug(" ]]\n");
-}
 
 typedef struct {
     HTTPStatusCode status;
@@ -151,6 +117,21 @@ typedef struct {
     usize len;
 } HTTPResponse;
 
+
+static HTTPRequest* req_init()
+{
+    HTTPRequest *req = malloc(sizeof(HTTPRequest));
+    assert(req != NULL);
+    memset(req, 0, sizeof(HTTPRequest));
+    req->header = map_init(64, false); 
+    return req;
+}
+
+static inline void req_free(HTTPRequest *req)
+{
+    map_free(req->header);
+    free(req);
+}
 
 static bool token(char ch)
 {
@@ -217,7 +198,7 @@ static void parse_request(Lexer *lexer, HTTPRequest *req, HTTPResponse *res)
     }
     lexer_skip(lexer, SP);
 
-    lexer_advance(lexer, &req->target.raw,  target);                          // target
+    lexer_advance(lexer, &req->target.raw,  target);                    // target
     req->target.form = get_target_form(&req->target.raw);
     if (req->target.form == TARGET_MALFORMED) {
         res->status = STATUS_MOVED_PERMANENTLY;
@@ -245,7 +226,7 @@ static void parse_request(Lexer *lexer, HTTPRequest *req, HTTPResponse *res)
 
         lexer_skip(lexer, CR); lexer_skip(lexer, LF);
 
-        da_append(req->header, ((HTTPHeaderFieldLine){field, value}));
+        map_insert(req->header, &field, &value);
 
         lexer_skip(lexer, CR);
         lexer_advance(lexer, &head_body_separator, LF);
@@ -281,20 +262,23 @@ static inline u32 write_header(char* dest, usize len)
     , date, len);
 }
 
+
+static void debug_http_request(HTTPRequest *req);
+
 static void* serve_request(void *void_fd)
 {
     i32 fd = *(i32 *)void_fd;
     free(void_fd);
 
-    HTTPRequest req = {0};
+    HTTPRequest *req = req_init();
     HTTPResponse res = {0};
     char buf[2048];
     
     ssize_t bytes = recv(fd, buf, sizeof(buf) - 1, 0);
     if (bytes > 0) {
         Lexer lexer = { buf, 0, bytes };
-        parse_request(&lexer, &req, &res);
-        debug_http_request(&req);
+        parse_request(&lexer, req, &res);
+        debug_http_request(req);
 
         char status_line[STATUS_LINE_MAX_LEN];
         char header[HEADER_FIELD_MAX_LEN];
@@ -315,7 +299,7 @@ static void* serve_request(void *void_fd)
         send(fd, buf, strlen(buf), 0);
         
     }
-    free(req.header.content);
+    req_free(req);
     close(fd);
     return NULL;
 }
@@ -373,4 +357,45 @@ i32 main()
     shutdown(serv_fd, SHUT_RD);
     close(serv_fd);
     return 0;
+}
+
+
+
+
+
+
+static void debug_http_request(HTTPRequest *req)
+{
+    if (DEBUG == 0) return;
+    debug("\n");
+    debug("[ ");
+        slice_debug(&req->method);
+    debug(" ]::");
+    debug("[ ");
+        slice_debug(&req->target.raw);
+        debug(" => "); debug_target_form(req->target.form);
+    debug(" ]::");
+    debug("[ ");
+        slice_debug(&req->version);
+    debug(" ]\n");
+
+    Slice *keys = NULL;
+    usize len;
+    map_get_keys(req->header, &keys, &len);
+    for (usize i = 0; i < len; i++) {
+        Slice dest;
+        if (map_find(req->header, &keys[i], &dest)) {
+            debug("[ ");
+                slice_debug(&keys[i]);
+            debug(" ]::");
+            debug("[ ");
+                slice_debug(&dest);
+            debug(" ]\n");
+        }
+    }
+    free(keys);
+
+    debug("[[ ");
+        slice_debug(&req->body);
+    debug(" ]]\n");
 }
